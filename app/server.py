@@ -4,7 +4,12 @@ Endpoints
 ---------
 GET  /healthz   liveness probe            -> {"status": "ok"}
 GET  /readyz    readiness probe           -> {"status": "ready"}
-POST /api/v1/invert   exact mass inversion
+POST /api/v1/invert          exact mass inversion
+POST /api/v1/invert/review   constrained review with disjoint group quotas
+
+The review entry accepts the same target/component document together with an
+optional ``groups`` declaration; it runs the *same* component validation and
+solver, enforcing every group quota jointly inside the search.
 
 The listening host/port come from environment variables (``API_HOST``,
 ``API_PORT``); the container port mapping is configured separately in
@@ -54,7 +59,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        if path != "/api/v1/invert":
+        if path not in ("/api/v1/invert", "/api/v1/invert/review"):
             self._send_json(404, {"error": {"code": "not_found",
                                             "message": f"unknown path {path!r}"}})
             return
@@ -113,7 +118,8 @@ def main() -> None:
     server = build_server(host, port)
     actual = server.server_address[1]
     print(f"oligomer-inverter listening on http://{host}:{actual} "
-          f"(endpoints: POST /api/v1/invert, GET /healthz)", flush=True)
+          f"(endpoints: POST /api/v1/invert, POST /api/v1/invert/review, "
+          f"GET /healthz)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
