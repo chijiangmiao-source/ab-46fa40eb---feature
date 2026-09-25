@@ -4,7 +4,9 @@ Endpoints
 ---------
 GET  /healthz   liveness probe            -> {"status": "ok"}
 GET  /readyz    readiness probe           -> {"status": "ready"}
-POST /api/v1/invert   exact mass inversion
+POST /api/v1/invert                exact mass inversion
+POST /api/v1/invert/constrained    exact mass inversion under declared,
+                                   pairwise-disjoint component-group quotas
 
 The listening host/port come from environment variables (``API_HOST``,
 ``API_PORT``); the container port mapping is configured separately in
@@ -20,9 +22,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from .errors import RequestError
-from .service import invert
+from .service import invert, invert_constrained
 
-MAX_BODY_BYTES = 1 << 20  # 1 MiB is ample for <= 16 components
+MAX_BODY_BYTES = 1 << 20  # 1 MiB is ample for <= 16 components / 16 groups
+
+ROUTES = {
+    "/api/v1/invert": invert,
+    "/api/v1/invert/constrained": invert_constrained,
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -54,7 +61,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        if path != "/api/v1/invert":
+        handler = ROUTES.get(path)
+        if handler is None:
             self._send_json(404, {"error": {"code": "not_found",
                                             "message": f"unknown path {path!r}"}})
             return
@@ -85,7 +93,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            status, payload = invert(body)
+            status, payload = handler(body)
         except RequestError as exc:
             self._send_json(400, {
                 "status": "invalid_request",
@@ -113,7 +121,8 @@ def main() -> None:
     server = build_server(host, port)
     actual = server.server_address[1]
     print(f"oligomer-inverter listening on http://{host}:{actual} "
-          f"(endpoints: POST /api/v1/invert, GET /healthz)", flush=True)
+          "(endpoints: POST /api/v1/invert, "
+          "POST /api/v1/invert/constrained, GET /healthz)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

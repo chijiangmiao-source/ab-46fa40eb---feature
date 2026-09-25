@@ -38,6 +38,13 @@ ORACLE_MAX_MODULUS = 2_000_000
 ORACLE_SCAN_LIMIT = 512
 _ORACLE_BLOCK = 256
 _INF = 10**30
+# Phase-1 grouped searches memoize exact states (i, mass, group-usages); the
+# memo is bounded so pathological residual fan-out cannot exhaust memory.
+_GROUP_MEMO_CAP = 500_000
+# Phase-2 exact-mass DPs likewise bound their memo tables; once the cap is
+# reached states are simply recomputed instead of cached (results are
+# unchanged; the node budget still bounds total work).
+_PHASE2_MEMO_CAP = 500_000
 
 
 class BudgetExceeded(Exception):
@@ -62,6 +69,7 @@ def _ceil_div(a: int, b: int) -> int:
 
 class Solver:
     def __init__(self, components: list[Component], target: int, tolerance: int,
+                 groups: Optional[list[dict]] = None,
                  node_budget: int = 5_000_000):
         # Canonical coordinate order: by component identifier.
         comps = sorted(components, key=lambda c: c.id)
@@ -78,6 +86,36 @@ class Solver:
         self.base = sum(self.lo[i] * self.m[i] for i in range(self.n))
         self.top = sum(self.hi[i] * self.m[i] for i in range(self.n))
         self.cap = [self.hi[i] - self.lo[i] for i in range(self.n)]
+
+        # Optional disjoint component groups with closed count quotas.
+        # ``group_of[pos]`` is the group index owning the canonical component
+        # at ``pos`` (groups are validated pairwise disjoint) or ``None``.
+        id_pos = {cid: i for i, cid in enumerate(self.ids)}
+        self.gnames: list[str] = []
+        self.gmembers: list[list[int]] = []
+        self.glo: list[int] = []
+        self.ghi: list[int] = []
+        self.group_of: list[Optional[int]] = [None] * self.n
+        self.group_base: list[int] = []
+        self.group_top: list[int] = []
+        if groups:
+            for g in groups:
+                gi = len(self.gnames)
+                self.gnames.append(g["name"])
+                self.glo.append(g["min"])
+                self.ghi.append(g["max"])
+                positions = sorted(id_pos[cid] for cid in g["components"])
+                self.gmembers.append(positions)
+                for p in positions:
+                    self.group_of[p] = gi
+                self.group_base.append(sum(self.lo[p] for p in positions))
+                self.group_top.append(sum(self.hi[p] for p in positions))
+        self.G = len(self.gnames)
+        # Effective quota window for the *added* counts y = x - lo.
+        self.glo_eff = [self.glo[g] - self.group_base[g]
+                        for g in range(self.G)]
+        self.ghi_eff = [self.ghi[g] - self.group_base[g]
+                        for g in range(self.G)]
 
     def _tick(self) -> None:
         self.nodes += 1
@@ -344,8 +382,285 @@ class Solver:
         return best, best_vec
 
     # ------------------------------------------------------------------ #
-    # Phase 2: minimum particle count at a fixed exact mass
+    # Phase 1 with group quotas
+    #
+    # The feasibility polyhedron now carries G extra sum constraints in
+    # addition to the per-component box, so suffix mass windows alone are not
+    # sound: feasibility of a prefix depends on how much of each group quota
+    # the prefix has consumed.  The search below therefore threads an exact
+    # tuple of per-group added counts, prunes with suffix mass windows plus a
+    # group-capacity window, and -- importantly -- optimizes directly inside
+    # the constrained set.  Nothing is filtered after an unconstrained solve.
     # ------------------------------------------------------------------ #
+
+    def _greedy_grouped(self, side: int) -> Optional[tuple[int, tuple[int, ...]]]:
+        """Group-respecting incumbent seed.
+
+        below: the smallest quota-feasible vector (every group at its lower
+        quota, its counts placed on the lightest members; ungrouped components
+        at their mins), then greedily filled toward the target without
+        exceeding it.  Returns ``None`` when even the smallest feasible vector
+        lies above the target.
+        above: the largest quota-feasible vector (groups at their upper
+        quotas on the heaviest members; ungrouped components at max), then
+        greedily trimmed toward the target without dropping below it.
+        """
+        x = self.lo[:]
+        u = [0] * self.G
+
+        if side == -1:
+            # Minimal feasible vector: lower-quota counts on lightest members.
+            for g in range(self.G):
+                need = self.glo_eff[g]
+                for p in sorted(self.gmembers[g], key=lambda i: self.m[i]):
+                    take = min(self.cap[p], need)
+                    x[p] += take
+                    u[g] += take
+                    need -= take
+            total = sum(x[i] * self.m[i] for i in range(self.n))
+            if total > self.T:
+                return None  # no feasible vector can be at or below target
+            # Fill toward T: repeatedly add the heaviest coin that fits.
+            for p in sorted(range(self.n), key=lambda i: -self.m[i]):
+                g = self.group_of[p]
+                room = self.cap[p] - (x[p] - self.lo[p])
+                if g is not None:
+                    room = min(room, self.ghi_eff[g] - u[g])
+                if room <= 0:
+                    continue
+                take = min(room, (self.T - total) // self.m[p])
+                if take > 0:
+                    x[p] += take
+                    total += take * self.m[p]
+                    if g is not None:
+                        u[g] += take
+            return total, tuple(x)
+
+        # Maximal feasible vector: upper-quota counts on heaviest members.
+        for g in range(self.G):
+            budget = self.ghi_eff[g]
+            for p in sorted(self.gmembers[g], key=lambda i: -self.m[i]):
+                take = min(self.cap[p], budget)
+                x[p] += take
+                u[g] += take
+                budget -= take
+        # Ungrouped components go to their individual maximums.
+        for p in range(self.n):
+            if self.group_of[p] is None:
+                x[p] = self.hi[p]
+        total = sum(x[i] * self.m[i] for i in range(self.n))
+        if total < self.T:
+            return None  # no feasible vector can be at or above target
+        # Trim toward T: remove the heaviest removable coin first.
+        for p in sorted(range(self.n), key=lambda i: -self.m[i]):
+            g = self.group_of[p]
+            removable = x[p] - self.lo[p]
+            if g is not None:
+                removable = min(removable, u[g] - self.glo_eff[g])
+            if removable <= 0:
+                continue
+            take = min(removable, (total - self.T) // self.m[p])
+            if take > 0:
+                x[p] -= take
+                total -= take * self.m[p]
+                if g is not None:
+                    u[g] -= take
+        if total < self.T:  # greedy overshot; no valid seed from this side
+            return None
+        return total, tuple(x)
+
+    def _extreme_grouped(self, side: int) -> Optional[tuple[int, tuple[int, ...]]]:
+        """Group-quota version of :meth:`_extreme`.
+
+        side = -1 maximizes M <= T; side = +1 minimizes M >= T, over exactly
+        the vectors satisfying every group quota simultaneously.
+        """
+        n, m, T, G = self.n, self.m, self.T, self.G
+
+        # Quick global feasibility of the group windows themselves (validation
+        # already guarantees member-bound attainability; this also covers the
+        # interaction with the mass sides).
+        for g in range(G):
+            if self.glo_eff[g] > self.ghi_eff[g]:
+                return None
+
+        # Suffix mass window over every component (DFS walks canonical order),
+        smax = [0] * (n + 1)
+        sg = [0] * (n + 2)
+        for i in range(n - 1, -1, -1):
+            smax[i] = smax[i + 1] + self.cap[i] * m[i]
+            sg[i] = gcd(m[i], sg[i + 1])
+
+        # Per-group suffix tables in canonical DFS order: remaining member
+        # capacity, all-full group mass, and lightest-first (mass, cap) runs
+        # for exact forced-mass / capped-mass bounds.
+        gcap = [[0] * G for _ in range(n + 1)]
+        gruns: list[list[list[tuple[int, int]]]] = [
+            [[] for _ in range(G)] for _ in range(n + 1)]
+        for i in range(n - 1, -1, -1):
+            for g in range(G):
+                gcap[i][g] = gcap[i + 1][g]
+                gruns[i][g] = list(gruns[i + 1][g])
+            g = self.group_of[i]
+            if g is not None:
+                gcap[i][g] += self.cap[i]
+                gruns[i][g] = sorted(gruns[i][g] + [(m[i], self.cap[i])])
+
+        seed = self._greedy_grouped(side)
+        best: Optional[int] = seed[0] if seed is not None else None
+        best_vec: Optional[tuple[int, ...]] = seed[1] if seed is not None else None
+
+        x = self.lo[:]
+        u = [0] * G
+        memo: set[tuple] = set()
+
+        def suffix_window(i: int) -> Optional[tuple[int, int]]:
+            """Group-forced suffix-contribution mass window, or ``None``.
+
+            Returns ``(forced, max_mass)`` where ``forced`` is the mass forced
+            by every outstanding group lower quota (lightest coins) and
+            ``max_mass`` is the mass still possible under every upper quota
+            (all-full suffix after the lightest excess coins are dropped).
+            Both bounds concern the *suffix contribution only*.
+            """
+            forced = 0
+            max_mass = smax[i]
+            for g in range(G):
+                low = self.glo_eff[g] - u[g]
+                high = self.ghi_eff[g] - u[g]
+                if high < 0 or low > gcap[i][g]:
+                    return None
+                if low > 0:
+                    forced += _run_lightest_sum(gruns[i][g], low)
+                excess = gcap[i][g] - high
+                if excess > 0:
+                    max_mass -= _run_lightest_sum(gruns[i][g], excess)
+            return forced, max_mass
+
+        def suffix_feasible(i: int, S: int) -> bool:
+            win = suffix_window(i)
+            if win is None:
+                return False
+            lo_q, hi_q = win
+            # Merge the target-side/incumbent interval (all expressed as
+            # suffix contributions Q with total S + Q).
+            if side == -1:
+                hi_q = min(hi_q, T - S)
+                if best is not None:
+                    lo_q = max(lo_q, best + 1 - S)
+            else:
+                lo_q = max(lo_q, T - S)
+                if best is not None:
+                    hi_q = min(hi_q, best - 1 - S)
+            if lo_q > hi_q or hi_q < 0:
+                return False
+            if lo_q < 0:
+                lo_q = 0
+            g = sg[i]
+            if g:
+                first = lo_q + ((-lo_q) % g)
+                if first > hi_q:
+                    return False
+            return True
+
+        def dfs(i: int, S: int) -> None:
+            nonlocal best, best_vec
+            if best == T:
+                return
+            self._tick()
+            if not suffix_feasible(i, S):
+                return
+
+            if i == n:
+                for g in range(G):
+                    if not (self.glo_eff[g] <= u[g] <= self.ghi_eff[g]):
+                        return
+                if side == -1 and S <= T and (best is None or S > best):
+                    best, best_vec = S, tuple(x)
+                elif side == 1 and S >= T and (best is None or S < best):
+                    best, best_vec = S, tuple(x)
+                return
+
+            # Exact-state memoization: identical (i, mass, usage) subtrees are
+            # equivalent.  The set is bounded so pathological residual fan-out
+            # cannot exhaust memory; once full the search simply stops pruning
+            # by this memo (node budget still applies).
+            key = (i, S, tuple(u))
+            if len(memo) < _GROUP_MEMO_CAP:
+                if key in memo:
+                    return
+                memo.add(key)
+
+            m_i = m[i]
+            g = self.group_of[i]
+            y_cur = x[i] - self.lo[i]
+            y_max = self.cap[i]
+            # Counts on this component must leave the rest of its group's
+            # window reachable with the remaining member positions.
+            y_min_group = 0
+            if g is not None:
+                outstanding_lo = self.glo_eff[g] - u[g]
+                y_min_group = max(0, outstanding_lo - gcap[i + 1][g])
+                y_max = min(y_max, self.ghi_eff[g] - u[g])
+            if y_max < 0 or y_min_group > y_max:
+                return
+
+            suffix_max = smax[i + 1]
+
+            if side == -1:
+                y_hi = min(y_max, (T - S) // m_i)
+                y_lo = y_min_group
+                if best is not None:
+                    # S + y*m_i + suffix_max must be able to beat best.
+                    y_lo = max(y_lo, (best - S - suffix_max) // m_i + 1)
+            else:
+                need = T - S - suffix_max
+                y_lo = max(y_min_group, _ceil_div(need, m_i))
+                y_hi = y_max
+                if best is not None:
+                    y_hi = min(y_hi, (best - 1 - S) // m_i)
+
+            if y_lo > y_hi:
+                return
+
+            # Visit the count closest to the target first, alternating outward;
+            # the constrained side (below -> smaller y, above -> larger y) goes
+            # first so the incumbent tightens quickly.
+            ideal = (T - S) // m_i
+            y0 = y_lo if ideal < y_lo else y_hi if ideal > y_hi else ideal
+
+            def visit(yv: int) -> None:
+                x[i] = self.lo[i] + yv
+                if g is not None:
+                    u[g] += yv - y_cur
+                dfs(i + 1, S + (yv - y_cur) * m_i)
+                if g is not None:
+                    u[g] -= yv - y_cur
+                x[i] = self.lo[i] + y_cur
+
+            visit(y0)
+            step = 1
+            while best != T:
+                down = y0 - step
+                up = y0 + step
+                if down < y_lo and up > y_hi:
+                    break
+                if side == -1:
+                    if down >= y_lo:
+                        visit(down)
+                    if up <= y_hi:
+                        visit(up)
+                else:
+                    if up <= y_hi:
+                        visit(up)
+                    if down >= y_lo:
+                        visit(down)
+                step += 1
+
+        dfs(0, self.base)
+        if best is None or best_vec is None:
+            return None
+        return best, best_vec
 
     def min_particles(self, mass: int, max_collect: int) -> dict:
         """Minimum-count vectors attaining the exact ``mass``.
@@ -385,6 +700,15 @@ class Solver:
 
         # memo[i][R] = (minimum suffix count, number of ways) or _INFEASIBLE.
         memo: list[dict[int, object]] = [dict() for _ in range(n + 1)]
+        memo_size = 0
+
+        def cache_put(i: int, R: int, value: object) -> None:
+            nonlocal memo_size
+            if R not in memo[i]:
+                if memo_size >= _PHASE2_MEMO_CAP:
+                    return  # stop caching; uncached states are recomputed
+                memo_size += 1
+            memo[i][R] = value
 
         def solve(i: int, R: int) -> Optional[tuple[int, int]]:
             if R == 0:
@@ -403,7 +727,7 @@ class Solver:
             y_hi = min(cap_i, R // m_i)
             y_lo = max(0, _ceil_div(R - smax[i + 1], m_i))
             if y_lo > y_hi:
-                memo[i][R] = None
+                cache_put(i, R, None)
                 return None
 
             cand = _congruence_candidates(y_lo, y_hi, m_i, R, g2)
@@ -424,7 +748,7 @@ class Solver:
                     y += step
 
             result = None if best_k is None else (best_k, best_ways)
-            memo[i][R] = result
+            cache_put(i, R, result)
             return result
 
         root = solve(0, R0)
@@ -447,8 +771,13 @@ class Solver:
                 collected.append(tuple(vec))
                 return
             entry = memo[i].get(R, _INFEASIBLE)
-            if entry is None or entry is _INFEASIBLE:
+            if entry is None:
                 return
+            if entry is _INFEASIBLE:
+                # Memo cap dropped this state; recompute it on demand.
+                entry = solve(i, R)
+                if entry is None:
+                    return
             target_k = entry[0]
             m_i, cap_i = mm[i], cc[i]
             y_hi = min(cap_i, R // m_i)
@@ -475,10 +804,233 @@ class Solver:
         }
 
     # ------------------------------------------------------------------ #
+    # Phase 2 with group quotas: exact minimum particle count at one mass
+    #
+    # The memoized suffix state is extended with the vector of per-group
+    # added counts already consumed, (i, R, u); transitions for a component
+    # that belongs to a group additionally clip the coin window to the
+    # outstanding quota interval.  The optimum is therefore computed *within*
+    # the constrained set directly -- it is never an unconstrained answer
+    # filtered afterwards.
+    # ------------------------------------------------------------------ #
+
+    def min_particles_grouped(self, mass: int, max_collect: int) -> dict:
+        """Group-quota version of :meth:`min_particles`."""
+        self.nodes = 0
+        R0 = mass - self.base
+        if R0 < 0:
+            raise ValueError("mass below box minimum")
+
+        n, G = self.n, self.G
+        order = sorted(range(n), key=lambda i: -self.m[i])
+        mm = [self.m[i] for i in order]
+        cc = [self.cap[i] for i in order]
+        og = [self.group_of[i] for i in order]
+
+        # Per ordered suffix position i and group g: total remaining member
+        # capacity, the member (mass, cap) pairs sorted lightest-first, and
+        # cumulative count/mass runs for exact lightest-k mass lookups.
+        suf_cap = [[0] * G for _ in range(n + 1)]
+        suf_runs: list[list[list[tuple[int, int]]]] = [
+            [[] for _ in range(G)] for _ in range(n + 1)]
+        for i in range(n - 1, -1, -1):
+            for g in range(G):
+                suf_cap[i][g] = suf_cap[i + 1][g]
+                suf_runs[i][g] = list(suf_runs[i + 1][g])
+            g = og[i]
+            if g is not None:
+                suf_cap[i][g] += cc[i]
+                suf_runs[i][g] = sorted(suf_runs[i][g] + [(mm[i], cc[i])])
+
+        smax = [0] * (n + 1)
+        sg = [0] * (n + 2)
+        for i in range(n - 1, -1, -1):
+            smax[i] = smax[i + 1] + cc[i] * mm[i]
+            sg[i] = gcd(mm[i], sg[i + 1])
+
+        def lightest_mass(i: int, g: int, k: int) -> int:
+            """Sum of the k lightest coins available to group g in suffix i."""
+            if k <= 0:
+                return 0
+            return _run_lightest_sum(suf_runs[i][g], k)
+
+        def _bounds_feasible(i: int, R: int, u: tuple[int, ...]) -> bool:
+            """Group count windows and forced suffix-mass window at state."""
+            if R > smax[i] or R % sg[i] != 0:
+                return False
+            min_forced = 0
+            max_allowed = smax[i]  # shrunk per group below
+            for g in range(G):
+                low = self.glo_eff[g] - u[g]
+                high = self.ghi_eff[g] - u[g]
+                if high < 0 or low > suf_cap[i][g]:
+                    return False
+                if low > 0:
+                    # The lower quota forces at least this much suffix mass.
+                    min_forced += lightest_mass(i, g, low)
+                excess = suf_cap[i][g] - high
+                if excess > 0:
+                    # Capping the group at 'high' coins: the lightest excess
+                    # coins must be dropped from the all-full suffix mass.
+                    max_allowed -= lightest_mass(i, g, excess)
+            return min_forced <= R <= max_allowed
+
+        zero = (0,) * G
+        if R0 == 0:
+            ok = all(self.glo_eff[g] <= 0 <= self.ghi_eff[g]
+                     for g in range(G))
+            if not ok:
+                raise ValueError("mass not attainable under group quotas")
+            return {
+                "particle_count": sum(self.lo),
+                "num_vectors": 1,
+                "vectors": [tuple(self.lo)],
+                "truncated": False,
+            }
+
+        if not _bounds_feasible(0, R0, zero):
+            raise ValueError("mass not attainable under group quotas")
+
+        memo: dict[tuple, Optional[tuple[int, int]]] = {}
+        INFEAS = _INFEASIBLE
+        memo_full = False
+
+        def cache_put(key: tuple, value: Optional[tuple[int, int]]) -> None:
+            nonlocal memo_full
+            if memo_full:
+                return
+            if len(memo) >= _PHASE2_MEMO_CAP:
+                memo_full = True
+                return
+            memo[key] = value
+
+        def solve(i: int, R: int,
+                  u: tuple[int, ...]) -> Optional[tuple[int, int]]:
+            if R == 0:
+                # No further coins: every lower quota must already be met.
+                for g in range(G):
+                    if not (self.glo_eff[g] <= u[g] <= self.ghi_eff[g]):
+                        return None
+                return (0, 1)
+            if i == n or not _bounds_feasible(i, R, u):
+                return None
+            key = (i, R, u)
+            cached = memo.get(key, INFEAS)
+            if cached is not INFEAS:
+                return cached
+            self._tick()
+
+            m_i, cap_i = mm[i], cc[i]
+            g = og[i]
+            y_hi = min(cap_i, R // m_i)
+            y_lo = max(0, _ceil_div(R - smax[i + 1], m_i))
+            if g is not None:
+                # Upper quota and the need to leave enough suffix capacity
+                # for the outstanding lower quota bound this coin's window.
+                y_hi = min(y_hi, self.ghi_eff[g] - u[g])
+                y_lo = max(y_lo,
+                           self.glo_eff[g] - u[g] - suf_cap[i + 1][g])
+            if y_lo > y_hi:
+                cache_put(key, None)
+                return None
+
+            cand = _congruence_candidates(y_lo, y_hi, m_i, R, sg[i + 1])
+            best_k: Optional[int] = None
+            best_ways = 0
+            if cand is not None:
+                y, step = cand
+                while y <= y_hi:
+                    if best_k is not None and y > best_k:
+                        break
+                    if g is not None:
+                        u2 = u[:g] + (u[g] + y,) + u[g + 1:]
+                    else:
+                        u2 = u
+                    sub = solve(i + 1, R - y * m_i, u2)
+                    if sub is not None:
+                        k = y + sub[0]
+                        if best_k is None or k < best_k:
+                            best_k, best_ways = k, sub[1]
+                        elif k == best_k:
+                            best_ways += sub[1]
+                    y += step
+
+            result = None if best_k is None else (best_k, best_ways)
+            cache_put(key, result)
+            return result
+
+        root = solve(0, R0, zero)
+        if root is None:
+            raise ValueError("mass not attainable under group quotas")
+        min_extra, num_ways = root
+
+        collected: list[tuple[int, ...]] = []
+
+        def collect(i: int, R: int, u: tuple[int, ...],
+                    prefix: list[int]) -> None:
+            if len(collected) >= max_collect:
+                return
+            if R == 0:
+                eff = [0] * n
+                for pos, y in enumerate(prefix):
+                    eff[pos] = y
+                vec = [0] * n
+                for pos, idx in enumerate(order):
+                    vec[idx] = self.lo[idx] + eff[pos]
+                collected.append(tuple(vec))
+                return
+            entry = memo.get((i, R, u), INFEAS)
+            if entry is None:
+                return  # cached infeasible state
+            if entry is INFEAS:
+                # Memo cap dropped this state; recompute it on demand.
+                entry = solve(i, R, u)
+                if entry is None:
+                    return
+            target_k = entry[0]
+            m_i, cap_i = mm[i], cc[i]
+            g = og[i]
+            y_hi = min(cap_i, R // m_i)
+            y_lo = max(0, _ceil_div(R - smax[i + 1], m_i))
+            if g is not None:
+                y_hi = min(y_hi, self.ghi_eff[g] - u[g])
+                y_lo = max(y_lo,
+                           self.glo_eff[g] - u[g] - suf_cap[i + 1][g])
+            cand = _congruence_candidates(y_lo, y_hi, m_i, R, sg[i + 1])
+            if cand is None:
+                return
+            y, step = cand
+            while y <= y_hi and y <= target_k:
+                if g is not None:
+                    u2 = u[:g] + (u[g] + y,) + u[g + 1:]
+                else:
+                    u2 = u
+                sub = solve(i + 1, R - y * m_i, u2)
+                if sub is not None and y + sub[0] == target_k:
+                    prefix.append(y)
+                    collect(i + 1, R - y * m_i, u2, prefix)
+                    prefix.pop()
+                y += step
+
+        collect(0, R0, zero, [])
+
+        return {
+            "particle_count": sum(self.lo) + min_extra,
+            "num_vectors": num_ways,
+            "vectors": collected,
+            "truncated": num_ways > len(collected),
+        }
+
+    # ------------------------------------------------------------------ #
     # Top-level driver
     # ------------------------------------------------------------------ #
 
     def solve(self, max_collect: int) -> dict:
+        if self.G:
+            return self._solve_grouped(max_collect)
+        return self._solve_plain(max_collect)
+
+    def _solve_plain(self, max_collect: int) -> dict:
         below = self._extreme(-1)
         above = self._extreme(1)
 
@@ -548,11 +1100,102 @@ class Solver:
             "nearest_above": self._witness(above),
         }
 
+    def _group_totals(self, vec: tuple[int, ...] | list[int]) -> list[int]:
+        return [sum(vec[p] for p in members) for members in self.gmembers]
+
+    def _solve_grouped(self, max_collect: int) -> dict:
+        below = self._extreme_grouped(-1)
+        above = self._extreme_grouped(1)
+
+        extremes: list[tuple[int, tuple[int, ...]]] = []
+        if below is not None:
+            extremes.append(below)
+        if above is not None:
+            extremes.append(above)
+        if not extremes:
+            # Validation guarantees a non-empty feasible set; reaching here
+            # means the quota windows are jointly inconsistent.
+            raise ValueError("no vector satisfies the group quotas")
+
+        best_dist = min(abs(mass - self.T) for mass, _ in extremes)
+        optimal_masses = sorted({mass for mass, _ in extremes
+                                 if abs(mass - self.T) == best_dist})
+
+        if best_dist > self.tol:
+            return {
+                "status": "unsatisfiable",
+                "target": self.T,
+                "tolerance": self.tol,
+                "within_tolerance": False,
+                "best_distance": best_dist,
+                "component_order": self.ids,
+                "nearest_below": self._witness(below),
+                "nearest_above": self._witness(above),
+            }
+
+        blocks = []
+        for mass in optimal_masses:
+            info = self.min_particles_grouped(mass, max_collect)
+            blocks.append({
+                "mass": mass,
+                "particle_count": info["particle_count"],
+                "num_vectors": info["num_vectors"],
+                "vectors": sorted(info["vectors"]),
+                "truncated": info["truncated"],
+            })
+        return self._grouped_result(
+            blocks, best_dist, optimal_masses, below, above)
+
+    def _grouped_result(self, blocks: list[dict], best_dist: int,
+                        optimal_masses: list[int],
+                        below: Optional[tuple[int, tuple[int, ...]]],
+                        above: Optional[tuple[int, tuple[int, ...]]]) -> dict:
+        """Assemble the grouped solver result from per-mass optimal blocks."""
+        if best_dist > self.tol:
+            return {
+                "status": "unsatisfiable",
+                "target": self.T,
+                "tolerance": self.tol,
+                "within_tolerance": False,
+                "best_distance": best_dist,
+                "component_order": self.ids,
+                "nearest_below": self._witness(below),
+                "nearest_above": self._witness(above),
+            }
+
+        best_particles = min(b["particle_count"] for b in blocks)
+        winners: list[tuple[int, ...]] = []
+        num_winners = 0
+        truncated = False
+        for b in blocks:
+            if b["particle_count"] == best_particles:
+                winners.extend(b["vectors"])
+                num_winners += b["num_vectors"]
+                truncated = truncated or b["truncated"]
+        winners.sort()
+
+        return {
+            "status": "optimal",
+            "target": self.T,
+            "tolerance": self.tol,
+            "within_tolerance": True,
+            "best_distance": best_dist,
+            "component_order": self.ids,
+            "optimal_masses": optimal_masses,
+            "particle_count": best_particles,
+            "num_optimal_explanations": num_winners,
+            "unique": num_winners == 1,
+            "truncated_list": truncated or num_winners > len(winners),
+            "vectors": winners,
+            "nearest_below": self._witness(below),
+            "nearest_above": self._witness(above),
+        }
+
     def _witness(self, extreme: Optional[tuple[int, tuple[int, ...]]]) -> Optional[dict]:
         if extreme is None:
             return None
         mass, vec = extreme
-        return {
+        doc = {
             "total_mass": mass,
             "error": mass - self.T,
             "absolute_error": abs(mass - self.T),
@@ -564,6 +1207,35 @@ class Solver:
                 for i in range(self.n)
             ],
         }
+        if self.G:
+            totals = self._group_totals(vec)
+            doc["group_totals"] = [
+                {"name": self.gnames[g],
+                 "components": [self.ids[p] for p in self.gmembers[g]],
+                 "total": totals[g],
+                 "min": self.glo[g], "max": self.ghi[g],
+                 "within_quota": self.glo[g] <= totals[g] <= self.ghi[g]}
+                for g in range(self.G)
+            ]
+        return doc
+
+
+def _run_lightest_sum(runs: list[tuple[int, int]], k: int) -> int:
+    """Sum of the ``k`` lightest coins from ``(mass, cap)`` runs.
+
+    ``runs`` is sorted by non-decreasing mass.  Group membership has at most
+    16 components, so a linear scan is exact and cheap; no count interval is
+    materialized.
+    """
+    total = 0
+    remaining = k
+    for mass, cap in runs:
+        take = cap if cap < remaining else remaining
+        total += take * mass
+        remaining -= take
+        if remaining == 0:
+            break
+    return total
 
 
 def _congruence_candidates(y_lo: int, y_hi: int, m_i: int, R: int,

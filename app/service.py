@@ -37,12 +37,30 @@ def _counts_doc(order: list[str], meta: dict[str, dict[str, int]],
     ]
 
 
+def _group_totals_doc(solver: Solver,
+                      vec: list[int] | tuple[int, ...]) -> list[dict[str, Any]]:
+    """Per-group totals directly recomputable from the reported counts."""
+    docs = []
+    for g, members in enumerate(solver.gmembers):
+        total = sum(vec[p] for p in members)
+        docs.append({
+            "name": solver.gnames[g],
+            "components": [solver.ids[p] for p in members],
+            "total": total,
+            "min": solver.glo[g],
+            "max": solver.ghi[g],
+            "within_quota": solver.glo[g] <= total <= solver.ghi[g],
+        })
+    return docs
+
+
 def _explanation(order: list[str], meta: dict[str, dict[str, int]],
                  mass: int, particle_count: int, target: int,
-                 vec: tuple[int, ...]) -> dict[str, Any]:
+                 vec: tuple[int, ...],
+                 solver: Solver | None = None) -> dict[str, Any]:
     counts = _counts_doc(order, meta, vec)
     recomputed = sum(c["mass_contribution"] for c in counts)
-    return {
+    doc = {
         "total_mass": mass,
         "error": mass - target,                 # signed, in micro-daltons
         "absolute_error": abs(mass - target),
@@ -50,6 +68,9 @@ def _explanation(order: list[str], meta: dict[str, dict[str, int]],
         "counts": counts,
         "recomputed_total_mass": recomputed,    # equals total_mass exactly
     }
+    if solver is not None and solver.G:
+        doc["group_totals"] = _group_totals_doc(solver, vec)
+    return doc
 
 
 def _witness_doc(order: list[str], meta: dict[str, dict[str, int]],
@@ -65,12 +86,27 @@ def _witness_doc(order: list[str], meta: dict[str, dict[str, int]],
         "counts": _counts_doc(order, meta, witness["vector"]),
         "recomputed_total_mass": witness["total_mass"],
         "side": "below" if witness["error"] <= 0 else "above",
+        **({"group_totals": witness["group_totals"]}
+           if witness.get("group_totals") is not None else {}),
     }
 
 
-def invert(body: Any) -> tuple[int, dict[str, Any]]:
-    """Execute one inversion. Returns (http_status, response_body)."""
-    parsed = parse_request(body)
+def _groups_echo(solver: Solver) -> list[dict[str, Any]] | None:
+    if not solver.G:
+        return None
+    return [
+        {
+            "name": solver.gnames[g],
+            "components": [solver.ids[p] for p in solver.gmembers[g]],
+            "min": solver.glo[g],
+            "max": solver.ghi[g],
+        }
+        for g in range(solver.G)
+    ]
+
+
+def _run(body: Any, *, constrained: bool) -> tuple[int, dict[str, Any]]:
+    parsed = parse_request(body, accept_groups=constrained)
 
     max_collect = DEFAULT_MAX_EXPLANATIONS
     if isinstance(body, dict) and "max_explanations" in body:
@@ -92,6 +128,7 @@ def invert(body: Any) -> tuple[int, dict[str, Any]]:
     }
 
     solver = Solver(components, parsed["target"], parsed["tolerance"],
+                    groups=parsed.get("groups"),
                     node_budget=_node_budget())
     try:
         result = solver.solve(max_collect)
@@ -116,15 +153,25 @@ def invert(body: Any) -> tuple[int, dict[str, Any]]:
         "nearest_below": _witness_doc(order, meta, result["nearest_below"], target),
         "nearest_above": _witness_doc(order, meta, result["nearest_above"], target),
     }
+    groups_echo = _groups_echo(solver)
+    if groups_echo is not None:
+        common["groups"] = groups_echo
 
     if result["status"] == "unsatisfiable":
+        message = ("no reachable total mass lies within the requested "
+                    "tolerance; the closest attainable witnesses below "
+                    "and above the target are provided")
+        if solver.G:
+            message = ("no count vector satisfying every declared group "
+                       "quota simultaneously reaches a total mass within "
+                       "the requested tolerance; the closest quota-feasible "
+                       "witnesses below and above the target are provided, "
+                       "and each group total can be recomputed from counts")
         return 200, {
             "status": "unsatisfiable",
             "within_tolerance": False,
             "best_absolute_error": result["best_distance"],
-            "message": ("no reachable total mass lies within the requested "
-                        "tolerance; the closest attainable witnesses below "
-                        "and above the target are provided"),
+            "message": message,
             **common,
         }
 
@@ -136,7 +183,8 @@ def invert(body: Any) -> tuple[int, dict[str, Any]]:
         mass = sum(vec[pos] * solver.m[pos] for pos in range(solver.n))
         assert mass in optimal_set
         explanations.append(_explanation(
-            order, meta, mass, result["particle_count"], target, vec))
+            order, meta, mass, result["particle_count"], target, vec,
+            solver if solver.G else None))
 
     # A distinct witness proving non-uniqueness of the two-level optimum.
     alternative = None
@@ -156,3 +204,13 @@ def invert(body: Any) -> tuple[int, dict[str, Any]]:
         "explanations": explanations,
         **common,
     }
+
+
+def invert(body: Any) -> tuple[int, dict[str, Any]]:
+    """Execute one unconstrained inversion. Returns (http_status, body)."""
+    return _run(body, constrained=False)
+
+
+def invert_constrained(body: Any) -> tuple[int, dict[str, Any]]:
+    """Execute one inversion under declared disjoint group quotas."""
+    return _run(body, constrained=True)
